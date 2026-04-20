@@ -132,7 +132,7 @@ wallpaper-picker/
 ---
 ## Troubleshooting
 
-¯\\_(ツ)_/¯
+¯\\_(ツ)\_/¯
 
 ## License
 
