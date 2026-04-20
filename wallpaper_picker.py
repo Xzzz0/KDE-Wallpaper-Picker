@@ -55,7 +55,8 @@ def _load_state() -> str:
 
 
 class _ThumbThread(QThread):
-    done = pyqtSignal(dict)  # {category_name: (orig_paths, thumb_paths)}
+    partial = pyqtSignal(dict)  # cached-only, emitted immediately on start
+    done = pyqtSignal(dict)     # full result after generating missing thumbs
 
     def __init__(self, directory: Path):
         super().__init__()
@@ -72,7 +73,11 @@ class _ThumbThread(QThread):
             return
 
         subdirs = sorted(e for e in entries if e.is_dir() and not e.name.startswith('.'))
-        categories = {}
+        root_files = sorted(e for e in entries
+                            if e.is_file() and e.suffix.lower() in extensions)
+
+        subdir_cached = {}   # name -> (orig_list, thumb_list) for already-cached
+        subdir_pending = {}  # name -> [Path, ...] needing generation
 
         for subdir in subdirs:
             try:
@@ -80,58 +85,77 @@ class _ThumbThread(QThread):
                                if p.is_file() and p.suffix.lower() in extensions)
             except PermissionError:
                 continue
-            orig, thumbs = self._process_files(files)
-            if orig:
-                categories[subdir.name] = (orig, thumbs)
+            c_o, c_t, pending = self._split(files)
+            subdir_cached[subdir.name] = (c_o, c_t)
+            subdir_pending[subdir.name] = pending
 
-        root_files = sorted(e for e in entries
-                            if e.is_file() and e.suffix.lower() in extensions)
+        root_c_o, root_c_t, root_pending = self._split(root_files)
 
-        if not categories:
-            orig, thumbs = self._process_files(root_files)
-            if orig:
-                self.done.emit({"All": (orig, thumbs)})
+        partial = self._assemble(subdir_cached, root_c_o, root_c_t, bool(subdirs))
+        if partial:
+            self.partial.emit(partial)
+
+        for name, pending in subdir_pending.items():
+            new_o, new_t = self._generate(pending)
+            co, ct = subdir_cached[name]
+            subdir_cached[name] = (co + new_o, ct + new_t)
+
+        new_root_o, new_root_t = self._generate(root_pending)
+        root_c_o += new_root_o
+        root_c_t += new_root_t
+
+        self.done.emit(self._assemble(subdir_cached, root_c_o, root_c_t, bool(subdirs)))
+
+    def _split(self, files):
+        cached_o, cached_t, pending = [], [], []
+        for img_path in files:
+            thumb_name = f"{img_path.parent.name}__{img_path.stem}_thumb.png"
+            thumb_path = THUMB_CACHE_DIR / thumb_name
+            if thumb_path.exists():
+                cached_o.append(str(img_path))
+                cached_t.append(str(thumb_path))
             else:
-                self.done.emit({})
-            return
+                pending.append(img_path)
+        return cached_o, cached_t, pending
 
-        if root_files:
-            orig, thumbs = self._process_files(root_files)
-            if orig:
-                categories["Unsorted"] = (orig, thumbs)
-
-        all_orig, all_thumbs = [], []
-        for name in sorted(categories):
-            o, t = categories[name]
-            all_orig.extend(o)
-            all_thumbs.extend(t)
-
-        result = {"All": (all_orig, all_thumbs)}
-        result.update(categories)
-        self.done.emit(result)
-
-    def _process_files(self, files):
+    def _generate(self, files):
         orig, thumbs = [], []
         for img_path in files:
             thumb_name = f"{img_path.parent.name}__{img_path.stem}_thumb.png"
             thumb_path = THUMB_CACHE_DIR / thumb_name
-            if not thumb_path.exists():
-                img = QImage(str(img_path))
-                if img.isNull():
-                    continue
-                scaled = img.scaled(
-                    BASE_W, BASE_H,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation
-                )
-                scaled.save(str(thumb_path))
+            img = QImage(str(img_path))
+            if img.isNull():
+                continue
+            scaled = img.scaled(
+                BASE_W, BASE_H,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            scaled.save(str(thumb_path))
             orig.append(str(img_path))
             thumbs.append(str(thumb_path))
         return orig, thumbs
 
+    def _assemble(self, subdir_data, root_o, root_t, has_subdirs):
+        categories = {n: (o, t) for n, (o, t) in subdir_data.items() if o}
+        if not has_subdirs:
+            return {"All": (root_o, root_t)} if root_o else {}
+        if root_o:
+            categories["Unsorted"] = (root_o, root_t)
+        if not categories:
+            return {}
+        all_o, all_t = [], []
+        for name in sorted(categories):
+            o, t = categories[name]
+            all_o.extend(o)
+            all_t.extend(t)
+        result = {"All": (all_o, all_t)}
+        result.update(categories)
+        return result
+
 
 class WallpaperLoader(QObject):
-    wallpapers_loaded = pyqtSignal(dict)  # {category: (paths, pixmaps)}
+    wallpapers_loaded = pyqtSignal(dict)  # {category: (orig_paths, thumb_paths)}
 
     def __init__(self, directory: Path):
         super().__init__()
@@ -155,15 +179,9 @@ class WallpaperLoader(QObject):
     def load(self):
         self._update_watched_dirs()
         self._thread = _ThumbThread(self.directory)
-        self._thread.done.connect(self._on_thumbs_ready)
+        self._thread.partial.connect(self.wallpapers_loaded)
+        self._thread.done.connect(self.wallpapers_loaded)
         self._thread.start()
-
-    def _on_thumbs_ready(self, categories: dict):
-        result = {}
-        for name, (orig_paths, thumb_paths) in categories.items():
-            pixmaps = [QPixmap(tp) for tp in thumb_paths]
-            result[name] = (orig_paths, pixmaps)
-        self.wallpapers_loaded.emit(result)
 
     def scan_paths(self) -> list:
         """Return sorted list of root-level image paths (used in tests)."""
@@ -180,8 +198,9 @@ class CarouselWidget(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._pixmaps: list = []
+        self._thumb_paths: list = []
         self._paths: list = []
+        self._pixmap_cache: dict = {}  # thumb_path -> QPixmap, lazy-loaded
         self._index = 0
         self._offset = 0.0
         self._vert_offset = 0.0
@@ -198,10 +217,16 @@ class CarouselWidget(QWidget):
 
         self.setMouseTracking(True)
 
-    def set_wallpapers(self, paths: list, pixmaps: list, direction: int = 0):
+    def _get_pixmap(self, i: int) -> QPixmap:
+        tp = self._thumb_paths[i]
+        if tp not in self._pixmap_cache:
+            self._pixmap_cache[tp] = QPixmap(tp)
+        return self._pixmap_cache[tp]
+
+    def set_wallpapers(self, paths: list, thumb_paths: list, direction: int = 0):
         """Load new wallpapers. direction: +1 slides in from below, -1 from above."""
         self._paths = paths
-        self._pixmaps = pixmaps
+        self._thumb_paths = thumb_paths
         self._index = 0
         self._offset = 0.0
         self._anim.stop()
@@ -221,9 +246,9 @@ class CarouselWidget(QWidget):
         self.update()
 
     def navigate(self, delta: int):
-        if not self._pixmaps:
+        if not self._thumb_paths:
             return
-        new_index = max(0, min(len(self._pixmaps) - 1, self._index + delta))
+        new_index = max(0, min(len(self._thumb_paths) - 1, self._index + delta))
         if new_index == self._index:
             return
         self._index = new_index
@@ -270,7 +295,7 @@ class CarouselWidget(QWidget):
     def _index_at(self, mouse_x: float):
         cx = self.width() / 2
         best, best_dist = None, float('inf')
-        for i in range(len(self._pixmaps)):
+        for i in range(len(self._thumb_paths)):
             dist = i - self._offset
             if abs(dist) > MAX_DIST + 0.5:
                 continue
@@ -284,7 +309,7 @@ class CarouselWidget(QWidget):
         return best
 
     def paintEvent(self, event):
-        if not self._pixmaps:
+        if not self._thumb_paths:
             return
 
         painter = QPainter(self)
@@ -295,7 +320,7 @@ class CarouselWidget(QWidget):
         cx = self.width() / 2
         cy = self.height() / 2  # fixed center; vert_offset applied via translate below
 
-        visible = [i for i in range(len(self._pixmaps))
+        visible = [i for i in range(len(self._thumb_paths))
                    if abs(i - self._offset) <= MAX_DIST + 0.5]
         visible.sort(key=lambda i: -abs(i - self._offset))
 
@@ -309,7 +334,7 @@ class CarouselWidget(QWidget):
             y = cy - h / 2
             shear = -dist * 0.09 if abs(dist) > 0.05 else 0.0
 
-            scaled_pm = self._pixmaps[i].scaled(
+            scaled_pm = self._get_pixmap(i).scaled(
                 w, h,
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation
@@ -362,7 +387,7 @@ class WallpaperPickerWindow(QWidget):
         self._carousel = CarouselWidget(self)
         self._carousel.setGeometry(0, HEADER_H, WIN_W, WIN_H)
 
-        self._categories: list = []  # [(name, paths, pixmaps), ...]
+        self._categories: list = []  # [(name, orig_paths, thumb_paths), ...]
         self._cat_index = 0
 
         self._loader = WallpaperLoader(WALLPAPER_DIR)
@@ -370,16 +395,17 @@ class WallpaperPickerWindow(QWidget):
         self._loader.load()
 
     def _on_loaded(self, categories: dict):
+        prev_name = self._categories[self._cat_index][0] if self._categories else None
         self._categories = []
         for name in sorted(k for k in categories if k != "All"):
-            paths, pixmaps = categories[name]
-            self._categories.append((name, paths, pixmaps))
+            orig, thumbs = categories[name]
+            self._categories.append((name, orig, thumbs))
         all_entry = categories.get("All")
         if all_entry:
             self._categories.append(("All", *all_entry))
 
-        # Restore last used category
-        last = _load_state()
+        # Restore last used category (prefer previously selected over persisted state)
+        last = prev_name or _load_state()
         self._cat_index = 0
         for i, (name, _, _) in enumerate(self._categories):
             if name == last:
@@ -387,8 +413,8 @@ class WallpaperPickerWindow(QWidget):
                 break
 
         if self._categories:
-            _, paths, pixmaps = self._categories[self._cat_index]
-            self._carousel.set_wallpapers(paths, pixmaps)
+            _, paths, thumbs = self._categories[self._cat_index]
+            self._carousel.set_wallpapers(paths, thumbs)
         self.update()
 
     def _switch_category(self, delta: int):
@@ -398,9 +424,9 @@ class WallpaperPickerWindow(QWidget):
         if new_idx < 0 or new_idx >= len(self._categories):
             return
         self._cat_index = new_idx
-        name, paths, pixmaps = self._categories[self._cat_index]
+        name, paths, thumbs = self._categories[self._cat_index]
         _save_state(name)
-        self._carousel.set_wallpapers(paths, pixmaps, direction=delta)
+        self._carousel.set_wallpapers(paths, thumbs, direction=delta)
         self.update()
 
     def showEvent(self, event):
