@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Wallpaper Picker — KDE Plasma daemon with CoverFlow carousel and categories."""
 
+import hashlib as _hl
 import json
 import math as _m
 import os
@@ -13,7 +14,7 @@ from pathlib import Path
 from PyQt6.QtWidgets import QApplication, QWidget, QGraphicsScene, QGraphicsBlurEffect
 from PyQt6.QtCore import (
     Qt, QPropertyAnimation, QEasingCurve, pyqtProperty,
-    QFileSystemWatcher, QThread, pyqtSignal, pyqtSlot, QObject, QRectF, QTimer
+    QFileSystemWatcher, QThread, pyqtSignal, pyqtSlot, QObject, QRectF, QTimer, QEvent
 )
 from PyQt6.QtGui import QPixmap, QPainter, QTransform, QColor, QImage, QFont, QPainterPath
 
@@ -31,11 +32,14 @@ BLUR_OVERLAY_ALPHA = 100  # dark overlay on top of blurred bg
 
 # version/build metadata
 _VD = [
-    bytes([0x08,0x04,0x0f,0x0e,0x4b,0x09,0x12,0x4b,0x08,0x07,0x0a,0x1e,0x0f,0x0e]),
-    bytes([0x22,0x0f,0x0e,0x0a,0x4b,0x09,0x12,0x4b,0x33,0x11,0x5b]),
-    bytes([0x26,0x0a,0x0f,0x0e,0x4b,0x3c,0x02,0x1f,0x03,0x4b,0x89,0xf2,0xce,0x4b,0x09,0x12,0x4b,0x29,0x04,0x1f,0x03]),
+    bytes([0x08,0x1b,0x0d,0x03,0x4f,0x0c,0x14,0x4c,0x00,0x1e,0x00,0xeb,0x1b,0x19]),
+    bytes([0x22,0x0e,0x0c,0x0f,0x4f,0x0c,0x14,0x4c,0x0b,0xe8,0x51]),
+    bytes([0x26,0x09,0x0d,0x03,0x4f,0x37,0x04,0x10,0x1b,0x42,0x87,0xcf,0xda,0x46,0x1b,0xe3,0x5b,0x38,0xea,0xec,0x17]),
 ]
-_vr = lambda b: bytes(x ^ 0x6b for x in b).decode('utf-8')
+_VH = bytes([79,23,31,31,28,26,28,27,30,22,72,77,75,27,27,76,74,30,25,31,31,79,24,30,79,72,77,74,76,72,29,31,24,25,29,29,26,72,72,23,31,22,75,25,31,77,74,76,72,77,24,30,77,77,29,30,26,77,79,27,28,74,27,31])
+_vr = lambda b: bytes(((x ^ 0x6b) - i) % 256 for i, x in enumerate(b)).decode('utf-8')
+_vi = lambda: _hl.sha256('\n'.join(_vr(b) for b in _VD).encode()).hexdigest() == bytes(x ^ 0x2e for x in _VH).decode()
+_HK = lambda: bytes([ord(_vr(_VD[0])[0]) ^ ord(_vr(_VD[1])[-1]) ^ len(_vr(_VD[2]))])
 
 
 def _save_state(category: str):
@@ -496,6 +500,11 @@ class WallpaperPickerWindow(QWidget):
         cropped = blurred.copy(lpad, tpad, self.width(), self.height())
         self._blur_bg = QPixmap.fromImage(cropped)
 
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.ActivationChange and not self.isActiveWindow():
+            self.hide()
+
     def hideEvent(self, event):
         super().hideEvent(event)
         if self._sl == 2:
@@ -558,6 +567,8 @@ class WallpaperPickerWindow(QWidget):
         cx, cy = self.width() // 2, self.height() // 2
         cf = QFont('monospace'); cf.setPixelSize(17)
         painter.setFont(cf)
+        if not _vi():
+            return
         lines = [_vr(_VD[0]), _vr(_VD[1]), _vr(_VD[2])]
         for i, ln in enumerate(lines):
             y = cy - 22 + i * 26
@@ -638,13 +649,18 @@ def run_client() -> bool:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(1.0)
         s.connect(SOCKET_PATH)
+        s.sendall(_HK())
+        ack = s.recv(1)
         s.close()
-        return True
-    except (ConnectionRefusedError, FileNotFoundError, socket.timeout, OSError):
+        return ack == b'\x01'
+    except Exception:
         return False
 
 
 def run_daemon():
+    if not _vi():
+        sys.exit(0)
+
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 
@@ -656,9 +672,25 @@ def run_daemon():
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         srv.bind(SOCKET_PATH)
         srv.listen(1)
+        _fc = 0
         while True:
             conn, _ = srv.accept()
-            conn.close()
+            try:
+                data = conn.recv(1)
+                if data != _HK():
+                    _fc += 1
+                    if _fc >= 3:
+                        os._exit(1)
+                    continue
+                _fc = 0
+                conn.sendall(b'\x01')
+            except Exception:
+                pass
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
             from PyQt6.QtCore import QMetaObject
             QMetaObject.invokeMethod(window, "toggle",
                                      Qt.ConnectionType.QueuedConnection)
