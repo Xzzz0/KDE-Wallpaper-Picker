@@ -130,6 +130,9 @@ wallpaper-picker/
 ```
 
 ---
+## Troubleshooting
+
+¯\_(ツ)_/¯
 
 ## License
 
