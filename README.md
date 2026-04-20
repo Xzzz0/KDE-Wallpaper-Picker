@@ -36,7 +36,7 @@ sudo pacman -S python-pyqt6
 ## Installation
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/wallpaper-picker.git
+git clone https://github.com/Xzzz0/KDE-Wallpaper-Picker
 cd wallpaper-picker
 bash install.sh
 ```
